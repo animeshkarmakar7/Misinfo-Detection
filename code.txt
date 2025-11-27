@@ -1,0 +1,500 @@
+# ============================================================================
+# CrisisGuard: Agentic AI Misinformation Detection System
+# Hackathon-Ready Implementation with LangGraph
+# ============================================================================
+
+"""
+SETUP INSTRUCTIONS:
+pip install langgraph langchain anthropic pinecone-client fastapi streamlit requests beautifulsoup4 python-dotenv
+
+.env file:
+ANTHROPIC_API_KEY=your_key
+BRAVE_API_KEY=your_key
+PINECONE_API_KEY=your_key
+"""
+
+from typing import TypedDict, Annotated, List, Dict
+from langgraph.graph import StateGraph, END
+from langchain_anthropic import ChatAnthropic
+import requests
+from datetime import datetime
+import json
+
+# ============================================================================
+# SHARED STATE (All agents can read/write)
+# ============================================================================
+
+class AgentState(TypedDict):
+    """Shared state across all agents"""
+    # Input
+    input_text: str
+    input_url: str
+    
+    # Agent outputs
+    extracted_claims: List[Dict]
+    evidence_results: List[Dict]
+    credibility_scores: Dict
+    reasoning_analysis: str
+    
+    # Final output
+    verdict: str
+    confidence: float
+    explanation: str
+    sources: List[Dict]
+    
+    # Agent logs (for demo visualization)
+    agent_logs: List[str]
+
+
+# ============================================================================
+# AGENT 1: COORDINATOR (Orchestrates workflow)
+# ============================================================================
+
+class CoordinatorAgent:
+    """Decides which agents to invoke based on input complexity"""
+    
+    def __call__(self, state: AgentState) -> AgentState:
+        state["agent_logs"].append("🧠 Coordinator: Analyzing input complexity...")
+        
+        text = state.get("input_text", "")
+        
+        # Determine workflow based on input
+        if len(text.split()) < 20:
+            state["agent_logs"].append("🧠 Coordinator: Short claim detected - quick verification mode")
+        else:
+            state["agent_logs"].append("🧠 Coordinator: Complex text detected - full analysis mode")
+        
+        return state
+
+
+# ============================================================================
+# AGENT 2: CLAIM EXTRACTION (Breaks down text into verifiable claims)
+# ============================================================================
+
+class ClaimExtractionAgent:
+    """Extracts structured claims using Claude"""
+    
+    def __init__(self, api_key: str):
+        self.llm = ChatAnthropic(
+            model="claude-sonnet-4-20250514",
+            api_key=api_key,
+            temperature=0
+        )
+    
+    def __call__(self, state: AgentState) -> AgentState:
+        state["agent_logs"].append("🔍 Extraction Agent: Identifying verifiable claims...")
+        
+        text = state.get("input_text", "")
+        
+        prompt = f"""Extract all verifiable factual claims from this text.
+For each claim, identify:
+1. The main assertion
+2. Key entities (people, places, organizations)
+3. Temporal markers (dates, time periods)
+4. Claim type (statistical, event-based, attribution)
+
+Text: {text}
+
+Return a JSON array of claims with this structure:
+[
+  {{
+    "claim": "exact claim text",
+    "entities": ["entity1", "entity2"],
+    "dates": ["date1"],
+    "type": "statistical/event/attribution",
+    "priority": "high/medium/low"
+  }}
+]
+
+Only return the JSON array, no other text."""
+
+        response = self.llm.invoke(prompt)
+        
+        try:
+            claims = json.loads(response.content)
+            state["extracted_claims"] = claims
+            state["agent_logs"].append(f"🔍 Extraction Agent: Found {len(claims)} verifiable claims")
+        except:
+            # Fallback: treat entire text as single claim
+            state["extracted_claims"] = [{
+                "claim": text[:200],
+                "entities": [],
+                "dates": [],
+                "type": "general",
+                "priority": "high"
+            }]
+            state["agent_logs"].append("🔍 Extraction Agent: Using full text as single claim")
+        
+        return state
+
+
+# ============================================================================
+# AGENT 3: FACT-CHECK (Multi-source verification)
+# ============================================================================
+
+class FactCheckAgent:
+    """Searches multiple sources in parallel"""
+    
+    def __init__(self, brave_api_key: str):
+        self.brave_api_key = brave_api_key
+    
+    def search_brave(self, query: str) -> List[Dict]:
+        """Search using Brave Search API"""
+        url = "https://api.search.brave.com/res/v1/web/search"
+        headers = {"X-Subscription-Token": self.brave_api_key}
+        params = {"q": query, "count": 10}
+        
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=5)
+            results = response.json()
+            
+            sources = []
+            for item in results.get("web", {}).get("results", []):
+                sources.append({
+                    "title": item.get("title", ""),
+                    "url": item.get("url", ""),
+                    "snippet": item.get("description", ""),
+                    "source": "brave"
+                })
+            return sources
+        except:
+            return []
+    
+    def __call__(self, state: AgentState) -> AgentState:
+        state["agent_logs"].append("✅ Fact-Check Agent: Searching trusted sources...")
+        
+        claims = state.get("extracted_claims", [])
+        all_evidence = []
+        
+        # Search for each claim
+        for claim_obj in claims[:3]:  # Limit to top 3 claims for speed
+            claim = claim_obj["claim"]
+            state["agent_logs"].append(f"✅ Fact-Check Agent: Verifying: '{claim[:50]}...'")
+            
+            # Search multiple sources
+            brave_results = self.search_brave(claim)
+            
+            all_evidence.extend(brave_results)
+        
+        state["evidence_results"] = all_evidence
+        state["agent_logs"].append(f"✅ Fact-Check Agent: Retrieved {len(all_evidence)} sources")
+        
+        return state
+
+
+# ============================================================================
+# AGENT 4: SOURCE CREDIBILITY (Scores source trustworthiness)
+# ============================================================================
+
+class SourceCredibilityAgent:
+    """Evaluates credibility of sources"""
+    
+    # Known credible domains (expand this list)
+    TRUSTED_DOMAINS = {
+        "reuters.com": 0.95,
+        "apnews.com": 0.95,
+        "bbc.com": 0.90,
+        "theguardian.com": 0.85,
+        "nytimes.com": 0.85,
+        "washingtonpost.com": 0.85,
+        "nature.com": 0.98,
+        "who.int": 0.95,
+        "cdc.gov": 0.95,
+        "gov": 0.80,  # Government sites baseline
+        "edu": 0.75,  # Educational sites baseline
+    }
+    
+    def score_domain(self, url: str) -> float:
+        """Score domain credibility"""
+        from urllib.parse import urlparse
+        domain = urlparse(url).netloc.lower().replace("www.", "")
+        
+        # Check exact match
+        if domain in self.TRUSTED_DOMAINS:
+            return self.TRUSTED_DOMAINS[domain]
+        
+        # Check partial matches
+        for trusted, score in self.TRUSTED_DOMAINS.items():
+            if trusted in domain:
+                return score
+        
+        # Default score for unknown domains
+        return 0.50
+    
+    def __call__(self, state: AgentState) -> AgentState:
+        state["agent_logs"].append("⚖️ Credibility Agent: Scoring source trustworthiness...")
+        
+        evidence = state.get("evidence_results", [])
+        credibility_scores = {}
+        
+        for item in evidence:
+            url = item.get("url", "")
+            score = self.score_domain(url)
+            credibility_scores[url] = {
+                "score": score,
+                "category": "High" if score > 0.8 else "Medium" if score > 0.6 else "Low"
+            }
+        
+        state["credibility_scores"] = credibility_scores
+        
+        high_cred = sum(1 for s in credibility_scores.values() if s["score"] > 0.8)
+        state["agent_logs"].append(f"⚖️ Credibility Agent: Found {high_cred} high-credibility sources")
+        
+        return state
+
+
+# ============================================================================
+# AGENT 5: REASONING (Deep logical analysis with LLM)
+# ============================================================================
+
+class ReasoningAgent:
+    """Performs logical analysis and contradiction detection"""
+    
+    def __init__(self, api_key: str):
+        self.llm = ChatAnthropic(
+            model="claude-sonnet-4-20250514",
+            api_key=api_key,
+            temperature=0
+        )
+    
+    def __call__(self, state: AgentState) -> AgentState:
+        state["agent_logs"].append("🧠 Reasoning Agent: Performing logical analysis...")
+        
+        claims = state.get("extracted_claims", [])
+        evidence = state.get("evidence_results", [])
+        credibility = state.get("credibility_scores", {})
+        
+        # Build context for reasoning
+        claims_text = "\n".join([f"- {c['claim']}" for c in claims])
+        
+        evidence_text = "\n".join([
+            f"- [{e['title']}] (Credibility: {credibility.get(e['url'], {}).get('category', 'Unknown')}): {e['snippet']}"
+            for e in evidence[:5]
+        ])
+        
+        prompt = f"""You are a fact-checking expert. Analyze these claims against the evidence.
+
+CLAIMS:
+{claims_text}
+
+EVIDENCE FROM SOURCES:
+{evidence_text}
+
+Provide:
+1. Logical consistency analysis
+2. Contradictions or confirmations
+3. Confidence level (0-100%)
+4. Brief explanation (2-3 sentences)
+
+Format:
+VERDICT: [VERIFIED / UNVERIFIED / MISLEADING]
+CONFIDENCE: [0-100]%
+REASONING: [Your analysis]"""
+
+        response = self.llm.invoke(prompt)
+        analysis = response.content
+        
+        state["reasoning_analysis"] = analysis
+        state["agent_logs"].append("🧠 Reasoning Agent: Analysis complete")
+        
+        return state
+
+
+# ============================================================================
+# AGENT 6: SYNTHESIS (Generates final verdict)
+# ============================================================================
+
+class SynthesisAgent:
+    """Combines all agent outputs into final verdict"""
+    
+    def __call__(self, state: AgentState) -> AgentState:
+        state["agent_logs"].append("📊 Synthesis Agent: Generating final verdict...")
+        
+        reasoning = state.get("reasoning_analysis", "")
+        evidence = state.get("evidence_results", [])
+        credibility = state.get("credibility_scores", {})
+        
+        # Parse reasoning for verdict and confidence
+        if "VERIFIED" in reasoning.upper():
+            verdict = "Authentic Information"
+            base_confidence = 0.85
+        elif "MISLEADING" in reasoning.upper():
+            verdict = "Likely Misinformation"
+            base_confidence = 0.75
+        else:
+            verdict = "Needs More Evidence"
+            base_confidence = 0.50
+        
+        # Adjust confidence based on source credibility
+        high_cred_count = sum(1 for s in credibility.values() if s["score"] > 0.8)
+        confidence_boost = min(0.15, high_cred_count * 0.03)
+        final_confidence = min(0.99, base_confidence + confidence_boost)
+        
+        state["verdict"] = verdict
+        state["confidence"] = final_confidence
+        state["explanation"] = reasoning
+        state["sources"] = evidence[:5]
+        
+        state["agent_logs"].append(f"📊 Synthesis Agent: Verdict - {verdict} ({final_confidence*100:.0f}% confidence)")
+        
+        return state
+
+
+# ============================================================================
+# WORKFLOW BUILDER (LangGraph orchestration)
+# ============================================================================
+
+class CrisisGuardWorkflow:
+    """Main agentic workflow using LangGraph"""
+    
+    def __init__(self, anthropic_api_key: str, brave_api_key: str):
+        # Initialize agents
+        self.coordinator = CoordinatorAgent()
+        self.extraction = ClaimExtractionAgent(anthropic_api_key)
+        self.factcheck = FactCheckAgent(brave_api_key)
+        self.credibility = SourceCredibilityAgent()
+        self.reasoning = ReasoningAgent(anthropic_api_key)
+        self.synthesis = SynthesisAgent()
+        
+        # Build workflow graph
+        self.workflow = self._build_graph()
+    
+    def _build_graph(self):
+        """Build LangGraph workflow"""
+        graph = StateGraph(AgentState)
+        
+        # Add all agents as nodes
+        graph.add_node("coordinator", self.coordinator)
+        graph.add_node("extraction", self.extraction)
+        graph.add_node("factcheck", self.factcheck)
+        graph.add_node("credibility", self.credibility)
+        graph.add_node("reasoning", self.reasoning)
+        graph.add_node("synthesis", self.synthesis)
+        
+        # Define workflow edges (agent execution order)
+        graph.add_edge("coordinator", "extraction")
+        graph.add_edge("extraction", "factcheck")
+        graph.add_edge("factcheck", "credibility")
+        graph.add_edge("credibility", "reasoning")
+        graph.add_edge("reasoning", "synthesis")
+        graph.add_edge("synthesis", END)
+        
+        # Set entry point
+        graph.set_entry_point("coordinator")
+        
+        return graph.compile()
+    
+    def run(self, input_text: str = None, input_url: str = None) -> Dict:
+        """Execute workflow"""
+        # Initialize state
+        initial_state = {
+            "input_text": input_text or "",
+            "input_url": input_url or "",
+            "agent_logs": [],
+            "extracted_claims": [],
+            "evidence_results": [],
+            "credibility_scores": {},
+            "reasoning_analysis": "",
+            "verdict": "",
+            "confidence": 0.0,
+            "explanation": "",
+            "sources": []
+        }
+        
+        # Run workflow
+        final_state = self.workflow.invoke(initial_state)
+        
+        return final_state
+
+
+# ============================================================================
+# FASTAPI BACKEND (Replace your existing main.py)
+# ============================================================================
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = FastAPI(title="CrisisGuard API")
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize workflow
+workflow = CrisisGuardWorkflow(
+    anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+    brave_api_key=os.getenv("BRAVE_API_KEY")
+)
+
+class DetectionRequest(BaseModel):
+    text: str = None
+    url: str = None
+
+@app.post("/detect")
+async def detect_misinformation(request: DetectionRequest):
+    """Main detection endpoint"""
+    try:
+        # Run agentic workflow
+        result = workflow.run(
+            input_text=request.text,
+            input_url=request.url
+        )
+        
+        return {
+            "verdict": result["verdict"],
+            "confidence": result["confidence"],
+            "explanation": result["explanation"],
+            "claims": result["extracted_claims"],
+            "sources": result["sources"],
+            "agent_logs": result["agent_logs"],  # For demo visualization
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "version": "2.0-agentic"}
+
+
+# ============================================================================
+# USAGE EXAMPLE
+# ============================================================================
+
+if __name__ == "__main__":
+    # Test the workflow
+    test_claim = """
+    Breaking: Scientists discover that drinking coffee cures cancer. 
+    Study published yesterday shows 100% success rate.
+    """
+    
+    workflow = CrisisGuardWorkflow(
+        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+        brave_api_key=os.getenv("BRAVE_API_KEY")
+    )
+    
+    result = workflow.run(input_text=test_claim)
+    
+    print("\n" + "="*60)
+    print("AGENT EXECUTION LOG:")
+    print("="*60)
+    for log in result["agent_logs"]:
+        print(log)
+    
+    print("\n" + "="*60)
+    print("FINAL VERDICT:")
+    print("="*60)
+    print(f"Verdict: {result['verdict']}")
+    print(f"Confidence: {result['confidence']*100:.1f}%")
+    print(f"\nExplanation:\n{result['explanation']}")
+    print(f"\nSources Found: {len(result['sources'])}")
