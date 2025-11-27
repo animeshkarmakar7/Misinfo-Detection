@@ -3,28 +3,28 @@ import requests
 import time
 
 # =========================================================
-# CONFIG
+# PAGE CONFIG
 # =========================================================
 st.set_page_config(
-    page_title="🛰️ FactRadar – Fast Misinformation Detector",
+    page_title="🛰️ FactRadar — AI Misinformation Detector",
     layout="wide",
 )
 
 API_URL = "http://127.0.0.1:8000/detect"
 
-st.title("🛰️ FactRadar — Hybrid Misinformation Detection System")
-st.markdown("### 🔍 Claim Extraction → Google Search → Web Scraping → Credibility Scoring")
+st.title("🛰️ FactRadar — AI-Ensemble Misinformation Detection")
+st.markdown("### ML (BART-MNLI) + Gemini 2.5 + Llama 3.1 + Web Scraping + Google CSE")
 st.markdown("---")
 
 # =========================================================
-# INPUT
+# INPUT SECTION
 # =========================================================
 mode = st.radio("Choose input type:", ["Claim Text", "URL"], horizontal=True)
 
 user_input = st.text_area(
-    "Paste a claim or URL:",
+    "Paste a claim or news article URL:",
     height=140,
-    placeholder="Example: Scientists discovered a new COVID variant in 2020 that spreads twice as fast globally."
+    placeholder="Example (Claim): COVID vaccine causes infertility\n\nExample (URL): https://example.com/news/abc"
 )
 
 # =========================================================
@@ -32,19 +32,19 @@ user_input = st.text_area(
 # =========================================================
 if st.button("Analyze", use_container_width=True):
 
-    st.markdown("⏳ **Running analysis...**")
+    st.markdown("⏳ **Running AI ensemble analysis...**")
+
     start = time.time()
 
-    # Prepare request payload
     payload = {
         "text": user_input if mode == "Claim Text" else None,
         "url": user_input if mode == "URL" else None,
     }
 
     try:
-        resp = requests.post(API_URL, json=payload, timeout=180)
-        resp.raise_for_status()
-        result = resp.json()
+        r = requests.post(API_URL, json=payload, timeout=200)
+        r.raise_for_status()
+        res = r.json()
     except Exception as e:
         st.error(f"❌ Backend Error: {e}")
         st.stop()
@@ -58,56 +58,55 @@ if st.button("Analyze", use_container_width=True):
     # =========================================================
     st.subheader("🧭 Final Verdict")
 
-    verdict = result.get("verdict", "Unknown")
-    conf = result.get("confidence", 0.0)
+    verdict = res["final_label"]
+    trust = res["trust_score"]
 
-    if verdict == "Supported":
-        st.success(f"🟢 Supported — Confidence {conf * 100:.1f}%")
-    elif verdict == "Refuted":
-        st.error(f"🔴 Refuted — Confidence {conf * 100:.1f}%")
-    elif verdict == "Needs More Evidence":
-        st.warning(f"🟡 Needs More Evidence — Confidence {conf * 100:.1f}%")
+    if verdict == "REAL":
+        st.success(f"🟢 REAL — Trust Score: {trust}%")
+    elif verdict == "MISINFORMATION":
+        st.error(f"🔴 MISINFORMATION — Trust Score: {trust}%")
     else:
-        st.info(f"⚪ Cannot Verify — Confidence {conf * 100:.1f}%")
+        st.warning(f"🟡 UNCERTAIN — Trust Score: {trust}%")
 
     st.markdown("---")
 
     # =========================================================
-    # CLAIM
+    # MODEL VOTES
     # =========================================================
-    st.subheader("🗣️ Extracted Claim")
-    st.info(result.get("claim", "No claim extracted"))
+    st.subheader("🗳️ Model Votes (AI Ensemble)")
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric("ML Model (BART-MNLI)", res["ml_label"])
+    col2.metric("Gemini 2.5 Flash", res["gemini_label"])
+    col3.metric("Llama 3.1 (OpenRouter)", res["llama_label"])
 
     st.markdown("---")
 
     # =========================================================
-    # EXPLANATION
+    # EXTRACTED CLAIM
     # =========================================================
-    st.subheader("📘 Explanation")
-    st.write(result.get("explanation", ""))
+    st.subheader("📝 Extracted Claim")
+    st.info(res["claim"])
 
     st.markdown("---")
 
     # =========================================================
-    # EVIDENCE & SOURCES
+    # EVIDENCE (SCRAPED)
     # =========================================================
-    st.subheader("🔎 Evidence & Sources (Google Search + Scraping)")
+    st.subheader("📚 Evidence Retrieved (Google CSE + Scraping)")
 
-    sources = result.get("sources", [])
+    evidence = res["evidence"]
 
-    if not sources:
-        st.warning("⚠️ No evidence sources found.")
+    if not evidence:
+        st.warning("⚠️ No evidence sources retrieved.")
     else:
-        for idx, src in enumerate(sources):
-            st.markdown(f"### Source {idx + 1}")
+        for idx, ev in enumerate(evidence):
+            st.markdown(f"### 🔗 Source {idx + 1}: [{ev['title']}]({ev['url']})")
 
-            st.markdown(f"**🔗 [{src['title']}]({src['url']})**")
-            st.write(f"**Snippet:** {src['snippet']}")
-            st.write(f"**Domain Credibility Score:** {src['domain_score']:.2f}")
-            st.write(f"**Source Label:** {src['source_label'].capitalize()} ({src['source_score']:.2f})")
-
-            with st.expander("📄 Full Extracted Text"):
-                st.write(src.get("scraped_text"))
+            st.write(f"**URL:** {ev['url']}")
+            st.write(f"**Extracted Text / Snippet:**")
+            st.info(ev["snippet"])
 
             st.markdown("---")
 
@@ -115,6 +114,7 @@ if st.button("Analyze", use_container_width=True):
     # LOGS
     # =========================================================
     st.subheader("🧠 Agent Logs")
-    logs = result.get("logs", [])
-    with st.expander("Show logs"):
+    logs = res.get("logs", [])
+
+    with st.expander("Show system logs"):
         st.code("\n".join(logs))
